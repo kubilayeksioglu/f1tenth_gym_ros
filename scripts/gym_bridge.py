@@ -1,15 +1,15 @@
 #!/usr/bin/env python
+from os import name
 import rospy
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import TransformStamped
-from geometry_msgs.msg import Transform
-from geometry_msgs.msg import Quaternion
+from geometry_msgs.msg import Transform, Point
+from geometry_msgs.msg import Quaternion, Vector3
 from ackermann_msgs.msg import AckermannDriveStamped
 
 from f1tenth_gym_ros.msg import RaceInfo
-
 from tf2_ros import transform_broadcaster
 from tf.transformations import quaternion_from_euler
 
@@ -17,16 +17,24 @@ import numpy as np
 
 from agents import PurePursuitAgent
 
-import gym
+
+def rotation_from_steer(steer):
+    rot = Quaternion()
+    wheel_quat = quaternion_from_euler(0., 0., steer)
+    rot.x, rot.y, rot.z, rot.w = wheel_quat
+    return rot
+
+
 class GymBridge(object):
     def __init__(self):
-        # get params
+        # get topic list
         self.ego_scan_topic = rospy.get_param('ego_scan_topic')
         self.ego_odom_topic = rospy.get_param('ego_odom_topic')
         self.opp_odom_topic = rospy.get_param('opp_odom_topic')
         self.ego_drive_topic = rospy.get_param('ego_drive_topic')
         self.race_info_topic = rospy.get_param('race_info_topic')
 
+        # this keeps
         self.scan_distance_to_base_link = rospy.get_param('scan_distance_to_base_link')
 
         self.map_path = rospy.get_param('map_path')
@@ -37,13 +45,13 @@ class GymBridge(object):
         scan_fov = rospy.get_param('scan_fov')
         scan_beams = rospy.get_param('scan_beams')
         self.angle_min = -scan_fov / 2.
-        self.angle_max = scan_fov/ 2.
+        self.angle_max = scan_fov / 2.
         self.angle_inc = scan_fov / scan_beams
 
         csv_path = rospy.get_param('waypoints_path')
-        
+
         wheelbase = 0.3302
-        mass= 3.47
+        mass = 3.47
         l_r = 0.17145
         I_z = 0.04712
         mu = 0.523
@@ -58,7 +66,7 @@ class GymBridge(object):
         # init opponent agent
         # TODO: init by params.yaml
         self.opp_agent = PurePursuitAgent(csv_path, wheelbase)
-        initial_state = {'x':[0.0, 200.0], 'y': [0.0, 200.0], 'theta': [0.0, 0.0]}
+        initial_state = {'x': [0.0, 200.0], 'y': [0.0, 200.0], 'theta': [0.0, 0.0]}
         self.obs, _, self.done, _ = self.racecar_env.reset(initial_state)
         self.ego_pose = [0., 0., 0.]
         self.ego_speed = [0., 0., 0.]
@@ -69,7 +77,7 @@ class GymBridge(object):
 
         # keep track of latest sim state
         self.ego_scan = list(self.obs['scans'][0])
-        
+
         # keep track of collision
         self.ego_collision = False
         self.opp_collision = False
@@ -84,7 +92,8 @@ class GymBridge(object):
         self.info_pub = rospy.Publisher(self.race_info_topic, RaceInfo, queue_size=1)
 
         # subs
-        self.drive_sub = rospy.Subscriber(self.ego_drive_topic, AckermannDriveStamped, self.drive_callback, queue_size=1)
+        self.drive_sub = rospy.Subscriber(self.ego_drive_topic, AckermannDriveStamped,
+                                          self.drive_callback, queue_size=1)
 
         # Timer
         self.timer = rospy.Timer(rospy.Duration(0.004), self.timer_callback)
@@ -114,7 +123,11 @@ class GymBridge(object):
         # opp_speed, self.opp_steer = self.opp_agent.plan(self.obs)
         opp_speed = 0.
         opp_steer = 0.
-        action = {'ego_idx': 0, 'speed': [ego_speed, opp_speed], 'steer': [self.ego_steer, self.opp_steer]}
+        action = {
+            'ego_idx': 0, 
+            'speed': [ego_speed, opp_speed], 
+            'steer': [self.ego_steer, self.opp_steer]
+        }
         self.obs, step_reward, self.done, info = self.racecar_env.step(action)
 
         self.update_sim_state()
@@ -146,10 +159,8 @@ class GymBridge(object):
     def publish_race_info(self, ts):
         info = RaceInfo()
         info.header.stamp = ts
-        if not self.ego_collision:
-            self.ego_collision = self.obs['collisions'][0]
-        if not self.opp_collision:
-            self.opp_collision = self.obs['collisions'][1]
+        self.ego_collision = self.ego_collision or self.obs['collisions'][0]
+        self.opp_collision = self.opp_collision or self.obs['collisions'][1]
         info.ego_collision = self.ego_collision
         info.opp_collision = self.opp_collision
         info.ego_elapsed_time = self.obs['lap_times'][0]
@@ -159,124 +170,91 @@ class GymBridge(object):
         self.info_pub.publish(info)
 
     def publish_odom(self, ts):
-        ego_odom = Odometry()
-        ego_odom.header.stamp = ts
-        ego_odom.header.frame_id = '/map'
-        ego_odom.child_frame_id = 'ego_racecar/base_link'
-        ego_odom.pose.pose.position.x = self.ego_pose[0]
-        ego_odom.pose.pose.position.y = self.ego_pose[1]
-        ego_quat = quaternion_from_euler(0., 0., self.ego_pose[2])
-        ego_odom.pose.pose.orientation.x = ego_quat[0]
-        ego_odom.pose.pose.orientation.y = ego_quat[1]
-        ego_odom.pose.pose.orientation.z = ego_quat[2]
-        ego_odom.pose.pose.orientation.w = ego_quat[3]
-        ego_odom.twist.twist.linear.x = self.ego_speed[0]
-        ego_odom.twist.twist.linear.y = self.ego_speed[1]
-        ego_odom.twist.twist.angular.z = self.ego_speed[2]
-        self.ego_odom_pub.publish(ego_odom)
+        def create_odom(namespace, stamp, pose, speed):
+            odom = Odometry()
+            odom.header.stamp = stamp
+            odom.header.frame_id = '/map'
+            odom.child_frame_id = '%s/base_link' % namespace
 
-        opp_odom = Odometry()
-        opp_odom.header.stamp = ts
-        opp_odom.header.frame_id = '/map'
-        opp_odom.child_frame_id = 'opp_racecar/base_link'
-        opp_odom.pose.pose.position.x = self.opp_pose[0]
-        opp_odom.pose.pose.position.y = self.opp_pose[1]
-        opp_quat = quaternion_from_euler(0., 0., self.opp_pose[2])
-        opp_odom.pose.pose.orientation.x = opp_quat[0]
-        opp_odom.pose.pose.orientation.y = opp_quat[1]
-        opp_odom.pose.pose.orientation.z = opp_quat[2]
-        opp_odom.pose.pose.orientation.w = opp_quat[3]
-        opp_odom.twist.twist.linear.x = self.opp_speed[0]
-        opp_odom.twist.twist.linear.y = self.opp_speed[1]
-        opp_odom.twist.twist.angular.z = self.opp_speed[2]
+            # calculate the position
+            odom.pose.pose.position.x = pose[0]
+            odom.pose.pose.position.y = pose[1]
+            odom.pose.pose.orientation = rotation_from_steer(pose[2])
+
+            odom.twist.twist.linear.x = speed[0]
+            odom.twist.twist.linear.y = speed[1]
+            odom.twist.twist.linear.z = speed[2]
+
+            return odom
+
+        ego_odom = create_odom("ego_racecar", ts, self.ego_pose, self.ego_speed)
+        opp_odom = create_odom("opp_racecar", ts, self.opp_pose, self.opp_speed)
+
+        self.ego_odom_pub.publish(ego_odom)
         self.opp_odom_pub.publish(opp_odom)
 
     def publish_transforms(self, ts):
-        ego_t = Transform()
-        ego_t.translation.x = self.ego_pose[0]
-        ego_t.translation.y = self.ego_pose[1]
-        ego_t.translation.z = 0.0
-        ego_quat = quaternion_from_euler(0.0, 0.0, self.ego_pose[2])
-        ego_t.rotation.x = ego_quat[0]
-        ego_t.rotation.y = ego_quat[1]
-        ego_t.rotation.z = ego_quat[2]
-        ego_t.rotation.w = ego_quat[3]
+        def create_ts(namespace, stamp, pose):
+            tl = Vector3()
+            tl.x, tl.y, tl.z = pose[0], pose[1], 0.0
 
-        ego_ts = TransformStamped()
-        ego_ts.transform = ego_t
-        ego_ts.header.stamp = ts
-        ego_ts.header.frame_id = '/map'
-        # TODO: check frame names
-        ego_ts.child_frame_id = 'ego_racecar/base_link'
+            # create the transform
+            # Why we're using pose[2] here? Why it's special
+            transform = Transform()
+            transform.translation = tl
+            transform.rotation = rotation_from_steer(pose[2])
 
-        opp_t = Transform()
-        opp_t.translation.x = self.opp_pose[0]
-        opp_t.translation.y = self.opp_pose[1]
-        opp_t.translation.z = 0.0
-        opp_quat = quaternion_from_euler(0.0, 0.0, self.opp_pose[2])
-        opp_t.rotation.x = opp_quat[0]
-        opp_t.rotation.y = opp_quat[1]
-        opp_t.rotation.z = opp_quat[2]
-        opp_t.rotation.w = opp_quat[3]
+            ts = TransformStamped()
+            ts.transform = transform
+            ts.header.stamp = stamp
+            ts.header.frame_id = '/map'
+            ts.child_frame_id = '%s/base_link' % namespace
 
-        opp_ts = TransformStamped()
-        opp_ts.transform = opp_t
-        opp_ts.header.stamp = ts
-        opp_ts.header.frame_id = '/map'
-        # TODO: check frame names
-        opp_ts.child_frame_id = 'opp_racecar/base_link'
+        # I think that create & send are not combined to make sure
+        ego_ts = create_ts('ego_racecar', ts, self.ego_pose)
+        opp_ts = create_ts('opp_racecar', ts, self.opp_pose)
 
         self.br.sendTransform(ego_ts)
         self.br.sendTransform(opp_ts)
 
     def publish_wheel_transforms(self, ts):
-        ego_wheel_ts = TransformStamped()
-        ego_wheel_quat = quaternion_from_euler(0., 0., self.ego_steer)
-        ego_wheel_ts.transform.rotation.x = ego_wheel_quat[0]
-        ego_wheel_ts.transform.rotation.y = ego_wheel_quat[1]
-        ego_wheel_ts.transform.rotation.z = ego_wheel_quat[2]
-        ego_wheel_ts.transform.rotation.w = ego_wheel_quat[3]
-        ego_wheel_ts.header.stamp = ts
-        ego_wheel_ts.header.frame_id = 'ego_racecar/front_left_hinge'
-        ego_wheel_ts.child_frame_id = 'ego_racecar/front_left_wheel'
-        self.br.sendTransform(ego_wheel_ts)
-        ego_wheel_ts.header.frame_id = 'ego_racecar/front_right_hinge'
-        ego_wheel_ts.child_frame_id = 'ego_racecar/front_right_wheel'
-        self.br.sendTransform(ego_wheel_ts)
+        def send_wheel_ts(namespace, stamp, steer):
 
+            # calculate wheel rotation from steer
+            wheel_ts = TransformStamped()
+            wheel_ts.transform.rotation = rotation_from_steer(steer)
+            wheel_ts.header.stamp = stamp
 
-        opp_wheel_ts = TransformStamped()
-        opp_wheel_quat = quaternion_from_euler(0., 0., self.opp_steer)
-        opp_wheel_ts.transform.rotation.x = opp_wheel_quat[0]
-        opp_wheel_ts.transform.rotation.y = opp_wheel_quat[1]
-        opp_wheel_ts.transform.rotation.z = opp_wheel_quat[2]
-        opp_wheel_ts.transform.rotation.w = opp_wheel_quat[3]
-        opp_wheel_ts.header.stamp = ts
-        opp_wheel_ts.header.frame_id = 'opp_racecar/front_left_hinge'
-        opp_wheel_ts.child_frame_id = 'opp_racecar/front_left_wheel'
-        self.br.sendTransform(opp_wheel_ts)
-        opp_wheel_ts.header.frame_id = 'opp_racecar/front_right_hinge'
-        opp_wheel_ts.child_frame_id = 'opp_racecar/front_right_wheel'
-        self.br.sendTransform(opp_wheel_ts)
+            # left & right side of the front wheel has the same angle
+            # (hence same transform)
+            for side in ['left', 'right']:
+                wheel_ts.header.frame_id = "%s/front_%s_hinge" % (namespace, side)
+                wheel_ts.header.frame_id = "%s/front_%s_hinge" % (namespace, side)
+                self.br.sendTransform(wheel_ts)
+
+        send_wheel_ts('ego_racecar', ts, self.ego_steer)
+        send_wheel_ts('opp_racecar', ts, self.opp_steer)
 
     def publish_laser_transforms(self, ts):
-        ego_scan_ts = TransformStamped()
-        ego_scan_ts.transform.translation.x = self.scan_distance_to_base_link
-        ego_scan_ts.transform.rotation.w = 1.
-        ego_scan_ts.header.stamp = ts
-        #TODO: check frame names
-        ego_scan_ts.header.frame_id = 'ego_racecar/base_link'
-        ego_scan_ts.child_frame_id = 'ego_racecar/laser'
-        self.br.sendTransform(ego_scan_ts)
+        def send_scan_ts(namespace, stamp, distance_to_base):
+            """
+            Creates a TransformStamped (Timestamped Geometry Transform) object
+            for the laser scan on Cars
 
-        opp_scan_ts = TransformStamped()
-        opp_scan_ts.transform.translation.x = self.scan_distance_to_base_link
-        opp_scan_ts.transform.rotation.w = 1.
-        opp_scan_ts.header.stamp = ts
-        #TODO: check frame names
-        opp_scan_ts.header.frame_id = 'opp_racecar/base_link'
-        opp_scan_ts.child_frame_id = 'opp_racecar/laser'
-        self.br.sendTransform(opp_scan_ts)
+            This function actually does nothing, since geometry of laser relative
+            to base does not change. So I'm not sure why we have it.
+            """
+            # TODO: check frame names
+            scan_ts = TransformStamped()
+            scan_ts.transform.translation.x = distance_to_base
+            scan_ts.transform.rotation.w = 1.
+            scan_ts.header.stamp = stamp
+            scan_ts.header.frame_id = '%s/base_link' % namespace
+            scan_ts.child_frame_id = '%s/laser' % namespace
+            self.br.sendTransform(scan_ts)
+
+        send_scan_ts("ego_racecar", ts, self.scan_distance_to_base_link)
+        send_scan_ts("opp_racecar", ts, self.scan_distance_to_base_link)
 
 
 if __name__ == '__main__':
